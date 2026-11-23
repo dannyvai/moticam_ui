@@ -11,14 +11,17 @@ It produces:
     dist/MoticamCapture/                 the program folder
         MoticamCapture.exe               the app (no Python needed)
         _internal/motic/MUCam32.dll ...  Motic camera SDK + the DLLs it needs
-        driver/                          Motic USB camera driver package (.inf/.sys/.cat)
+        driver/<name>/                   Motic camera driver packages (.inf/.sys/.cat), one per folder
         install_driver.bat / .ps1        installs that driver if a PC doesn't have it
         README.txt
     dist/MoticamCapture-<version>-win64.zip
 
 Options:
     --motic-dll PATH     MUCam DLL to bundle (default: found automatically)
-    --driver-dir PATH    driver package folder to bundle (default: from the Windows driver store)
+    --driver-dir PATH    driver package folder to bundle (default: the driver the connected camera
+                         uses, plus every other Motic driver in the Windows driver store)
+    --drivers-from PATH  also search PATH for Motic drivers, e.g. the "Drivers" folder of the
+                         Motic Images Plus installer (works without the camera plugged in)
     --no-driver          do not bundle the driver
     --no-zip             skip the zip file
 
@@ -28,7 +31,9 @@ computers; ask Motic before distributing the package to others.
 
 import argparse
 import glob
+import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -115,43 +120,127 @@ def collect_dlls(main_dll):
     return list(found.values())
 
 
-# --------------------------------------------------------------------------- driver package
-def find_driver_package():
-    """Folder of the installed Motic camera driver in the Windows driver store."""
+# --------------------------------------------------------------------------- driver packages
+MOTIC_VID = "232F"
+PID_RE = re.compile(r"USB\\VID_232F&PID_([0-9A-F]{4})", re.I)
+
+
+def inf_text(path):
+    raw = open(path, "rb").read()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff") or raw[1:2] == b"\0":
+        return raw.decode("utf-16", "replace")
+    return raw.decode("latin-1", "replace")
+
+
+def inf_source_files(text):
+    """File names listed in the [SourceDisksFiles...] sections - everything the package needs."""
+    files, in_section = set(), False
+    for line in text.splitlines():
+        line = line.split(";", 1)[0].strip()
+        if line.startswith("["):
+            in_section = line.lower().startswith("[sourcedisksfiles")
+        elif in_section and "=" in line:
+            files.add(line.split("=", 1)[0].strip().strip('"'))
+    return files
+
+
+def find_driver_packages(sources=()):
+    """Every Motic (USB VID 232F) driver package in the Windows driver store and in `sources`
+    (for example the Drivers folder of the Motic Images Plus installer)."""
     store = os.path.join(SYSTEM32, "DriverStore", "FileRepository")
-    candidates = []
-    for d in glob.glob(os.path.join(store, "*")):
-        name = os.path.basename(d).lower()
-        if "motic" not in name:
-            continue
-        for inf in glob.glob(os.path.join(d, "*.inf")):
-            try:
-                raw = open(inf, "rb").read()
-            except OSError:
-                continue
-            text = raw.decode("utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "latin-1", "replace")
-            if "232f" in text.lower():
-                candidates.append(d)
-                break
-    if candidates:
-        return max(candidates, key=os.path.getmtime)
-    return export_driver_with_pnputil()
-
-
-def export_driver_with_pnputil():
-    """Fallback: find the oemNN.inf that mentions the Motic USB ID and export it (may need admin)."""
-    inf_dir = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "INF")
-    for inf in glob.glob(os.path.join(inf_dir, "oem*.inf")):
+    infs = [(inf, "driver store") for inf in glob.glob(os.path.join(store, "*", "*.inf"))]
+    for src in sources:
+        infs += [(inf, src) for inf in glob.glob(os.path.join(src, "**", "*.inf"), recursive=True)]
+    pkgs = []
+    for inf, origin in infs:
+        d = os.path.dirname(inf)
         try:
-            if b"232f" not in open(inf, "rb").read().lower().replace(b"\0", b""):
+            if os.path.getsize(inf) > 4_000_000:
                 continue
+            text = inf_text(inf)
         except OSError:
             continue
-        dest = tempfile.mkdtemp(prefix="motic_driver_")
-        r = subprocess.run(["pnputil", "/export-driver", os.path.basename(inf), dest], capture_output=True, text=True)
-        if r.returncode == 0 and glob.glob(os.path.join(dest, "**", "*.inf"), recursive=True):
-            return dest
-    return None
+        pids = {p.upper() for p in PID_RE.findall(text)}
+        if not pids:
+            continue
+        present = {f.lower() for _, _, fs in os.walk(d) for f in fs}
+        missing = sorted(f for f in inf_source_files(text) if f.lower() not in present)
+        ver = re.search(r"DriverVer\s*=\s*([^\r\n;]+)", text, re.I)
+        pkgs.append({"dir": d, "inf": inf, "name": os.path.basename(inf), "pids": pids, "missing": missing,
+                     "origin": origin,
+                     "version": ver.group(1).strip() if ver else "?", "bytes": open(inf, "rb").read()})
+    return pkgs
+
+
+def connected_motic_cameras():
+    """[(pid, status, bound oemNN.inf)] for Motic cameras plugged in right now."""
+    ps = ("Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match 'VID_232F' } | "
+          "ForEach-Object { [pscustomobject]@{ Id = $_.InstanceId; Status = [string]$_.Status; "
+          "Inf = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_DriverInfPath "
+          "-ErrorAction SilentlyContinue).Data } } | ConvertTo-Json -Compress")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                             timeout=60).stdout.strip()
+        data = json.loads(out) if out else []
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    cams = []
+    for d in data:
+        m = re.search(r"PID_([0-9A-F]{4})", d.get("Id") or "", re.I)
+        if m:
+            cams.append((m.group(1).upper(), d.get("Status") or "", d.get("Inf") or ""))
+    return cams
+
+
+def choose_driver_packages(sources=()):
+    """Pick the packages to bundle. Fails loudly if the connected camera's driver is not among them."""
+    pkgs = find_driver_packages(sources)
+    cams = connected_motic_cameras()
+    inf_dir = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "INF")
+    chosen = {}
+    # 1. the exact package each connected camera is using (oemNN.inf is a byte copy of it)
+    for pid, status, bound in cams:
+        print(f"Connected Motic camera: PID {pid}, status {status}, driver {bound or 'none'}")
+        bound_bytes = None
+        if bound:
+            try:
+                bound_bytes = open(os.path.join(inf_dir, bound), "rb").read()
+            except OSError:
+                pass
+        exact = [p for p in pkgs if bound_bytes is not None and p["bytes"] == bound_bytes]
+        fits = [p for p in pkgs if pid in p["pids"]]
+        # prefer: the exact package the camera uses, then complete packages, then the newest
+        fits.sort(key=lambda p: (p not in exact, bool(p["missing"]), -os.path.getmtime(p["inf"])))
+        if not fits:
+            sys.exit(f"ERROR: no driver package supports this camera (USB\\VID_232F&PID_{pid}).\n"
+                     "Pass --drivers-from with the Drivers folder of the Motic Images Plus installer.")
+        best = fits[0]
+        if best["missing"]:
+            sys.exit(f"ERROR: the driver for this camera ({best['name']}) is incomplete, missing: "
+                     f"{', '.join(best['missing'])}.\nPass --drivers-from with the Drivers folder of the "
+                     "Motic Images Plus installer.")
+        chosen[best["name"].lower()] = best
+    if not cams:
+        print("NOTE: no Motic camera is plugged in, so the build cannot check which driver it needs.")
+    # 2. one complete copy of every other Motic driver, so other Motic camera models work too
+    by_name = {}
+    for p in pkgs:
+        by_name.setdefault(p["name"].lower(), []).append(p)
+    for name, group in sorted(by_name.items()):
+        if name in chosen:
+            continue
+        complete = sorted((p for p in group if not p["missing"]), key=lambda p: -os.path.getmtime(p["inf"]))
+        if complete:
+            chosen[name] = complete[0]
+        else:
+            print(f"Skipping {group[0]['name']} (not for the connected camera): every copy found is incomplete, "
+                  f"missing {', '.join(group[0]['missing'])}")
+    for p in chosen.values():
+        pids = ", ".join(sorted(p["pids"]))
+        print(f"Bundling {p['name']} {p['version']}  (PID {pids})  from {p['dir']}")
+    return list(chosen.values())
 
 
 # --------------------------------------------------------------------------- build
@@ -159,6 +248,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--motic-dll")
     ap.add_argument("--driver-dir")
+    ap.add_argument("--drivers-from", action="append", default=[],
+                    help="folder to search for Motic drivers, e.g. the Motic Images Plus installer's Drivers folder")
     ap.add_argument("--no-driver", action="store_true")
     ap.add_argument("--no-zip", action="store_true")
     ap.add_argument("--allow-no-sdk", action="store_true", help="build even if the Motic DLL is missing")
@@ -184,15 +275,27 @@ def main():
     else:
         print("WARNING: building without the Motic SDK DLL.")
 
-    # 2. driver package
-    driver = None
+    # 2. driver packages
+    drivers = []                                  # (source folder, name of subfolder in the package)
     if not args.no_driver:
-        driver = args.driver_dir or find_driver_package()
-        if driver:
-            print("Driver package:", driver)
+        if args.driver_dir:
+            infs = glob.glob(os.path.join(args.driver_dir, "**", "*.inf"), recursive=True)
+            if not infs:
+                sys.exit(f"No .inf file in {args.driver_dir}")
+            drivers.append((args.driver_dir, os.path.splitext(os.path.basename(infs[0]))[0]))
         else:
-            print("WARNING: Motic driver package not found - building without it "
-                  "(use --driver-dir to point at the driver folder).")
+            for src in args.drivers_from:
+                if not os.path.isdir(src):
+                    sys.exit(f"--drivers-from: folder not found: {src}")
+            used = set()
+            for p in choose_driver_packages(args.drivers_from):
+                sub = os.path.splitext(p["name"])[0]
+                while sub.lower() in used:
+                    sub += "_2"
+                used.add(sub.lower())
+                drivers.append((p["dir"], sub))
+        if not drivers:
+            print("WARNING: no Motic driver package found - building without a driver.")
 
     # 3. PyInstaller
     import PyInstaller.__main__
@@ -217,8 +320,9 @@ def main():
     PyInstaller.__main__.run(pyi)
 
     # 4. driver + installer + readme next to the exe
-    if driver:
-        shutil.copytree(driver, os.path.join(target, "driver"), dirs_exist_ok=True)
+    for src_dir, sub in drivers:
+        shutil.copytree(src_dir, os.path.join(target, "driver", sub), dirs_exist_ok=True)
+    if drivers:
         for name in ("install_driver.ps1", "install_driver.bat"):
             shutil.copy2(os.path.join(ROOT, "scripts", name), target)
     with open(os.path.join(target, "README.txt"), "w", encoding="utf-8") as f:

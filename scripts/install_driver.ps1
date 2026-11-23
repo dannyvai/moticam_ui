@@ -28,18 +28,18 @@ if ($infs.Count -eq 0) {
     exit 1
 }
 
-# Is a Motic driver already in the Windows driver store?
-$installed = @(Select-String -Path "$env:windir\INF\oem*.inf" -Pattern 'VID_232F' -SimpleMatch -List `
-               -ErrorAction SilentlyContinue)
+# Plugged-in Motic cameras and whether Windows has a working driver for them.
 $devices = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
              Where-Object { $_.InstanceId -match 'VID_232F' })
+foreach ($d in $devices) { Write-Host ("Camera: {0}  ({1})  status: {2}" -f $d.FriendlyName, $d.InstanceId, $d.Status) }
 
-if ($installed.Count -gt 0 -and -not $Force) {
-    Write-Host ("A Motic driver is already installed (" + (($installed | ForEach-Object { $_.Filename }) -join ', ') + ').') -ForegroundColor Green
-    foreach ($d in $devices) { Write-Host ("  Camera: {0}  status: {1}" -f $d.FriendlyName, $d.Status) }
-    Write-Host 'Nothing to do. Run with -Force to reinstall.'
+if ($devices.Count -gt 0 -and -not $Force -and -not ($devices | Where-Object { $_.Status -ne 'OK' })) {
+    Write-Host 'The camera already has a working driver. Nothing to do (use -Force to reinstall).' -ForegroundColor Green
     pause
     exit 0
+}
+if ($devices.Count -eq 0) {
+    Write-Host 'No Motic camera is plugged in - the driver will be added so it is ready when you connect one.'
 }
 
 $failed = $false

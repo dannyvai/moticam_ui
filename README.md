@@ -125,13 +125,24 @@ already works. It creates:
 dist/MoticamCapture/
     MoticamCapture.exe        the program
     _internal/motic/          MUCam32.dll and the DLLs it needs, copied from Motic Images Plus
-    driver/                   the Motic camera driver package from the Windows driver store
+    driver/<name>/            Motic camera drivers from the Windows driver store: the one the
+                              connected camera uses, plus every other Motic driver found
     install_driver.bat/.ps1   installs that driver
     README.txt
 dist/MoticamCapture-<version>-win64.zip
 ```
 
-Options: `--motic-dll PATH`, `--driver-dir PATH`, `--no-driver`, `--no-zip`.
+Keep the camera plugged in while building: the script asks Windows which driver the camera uses
+and stops with an error if that driver is not in the driver store or is missing files.
+
+To take the drivers from the Motic Images Plus installer instead (no camera needed), point the
+build at its `Drivers` folder:
+
+```
+build.bat --drivers-from "C:\path\to\Plus3.0ForPC(Trialx64)\20160322\Drivers"
+```
+
+Options: `--motic-dll PATH`, `--driver-dir PATH`, `--drivers-from PATH`, `--no-driver`, `--no-zip`.
 
 The bundled DLL and driver are Motic's software. That is fine for your own lab's computers;
 ask Motic before giving the package to others.
