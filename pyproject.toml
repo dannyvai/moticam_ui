@@ -1,0 +1,25 @@
+[project]
+name = "moticam"
+version = "0.1.0"
+description = "Capture images from a Moticam / USB camera"
+readme = "README.md"
+authors = [
+    { name = "Danny Wainshtein", email = "danny.wainshtein@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.3",
+    "opencv-python>=4.12",
+    "pillow>=11",
+]
+
+[project.scripts]
+moticam = "moticam:main"
+moticam-ui = "moticam.ui:main"
+
+[dependency-groups]
+build = ["pyinstaller>=6.16"]
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
